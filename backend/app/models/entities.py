@@ -10,7 +10,12 @@ class UserProfile(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     token = Column(String(64), unique=True, index=True, nullable=False)
     
-    # Анонімні параметри профілю
+    # Авторизація за телефоном
+    phone = Column(String(32), unique=True, index=True, nullable=True)
+    password_hash = Column(String(255), nullable=True)
+    full_name = Column(String(128), nullable=True)
+
+    # Параметри профілю ветерана
     status = Column(String(64), nullable=True) # "ubd", "active_duty", "disability", "family_member"
     region = Column(String(64), default="Львівська область")
     city = Column(String(64), default="Львів")
@@ -65,7 +70,7 @@ class Opportunity(Base):
     """Вакансії, програми перекваліфікації, гранти та реабілітація"""
     __tablename__ = "opportunities"
 
-    id = Column(String(64), primary_key=True)
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
     partner_id = Column(String(64), nullable=False)
     partner_name = Column(String(128), nullable=False)
     title = Column(String(255), nullable=False)
@@ -77,6 +82,8 @@ class Opportunity(Base):
     contact_url = Column(String(512), nullable=True)
     salary_range = Column(String(64), nullable=True)
     is_active = Column(Boolean, default=True)
+    source = Column(String(32), default="web") # "web" або "telegram_bot"
+    created_at = Column(DateTime, default=datetime.utcnow)
 
     leads = relationship("PartnerLead", back_populates="opportunity")
 
@@ -101,7 +108,21 @@ class KnowledgeBaseItem(Base):
     __tablename__ = "knowledge_base"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    topic = Column(String(128), nullable=False) # "Статус УБД", "Виплати за поранення", "Пільги Львів"
+    topic = Column(String(128), nullable=False)
     summary = Column(Text, nullable=False)
     official_source = Column(String(512), nullable=False)
     contacts = Column(String(255), nullable=True)
+
+
+class FeedbackItem(Base):
+    """Зауваження, відгуки та повідомлення про проблеми від користувачів/партнерів"""
+    __tablename__ = "feedback_items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sender_name = Column(String(128), nullable=True)
+    sender_contact = Column(String(128), nullable=True) # телефон або telegram нік
+    category = Column(String(64), default="general") # "suggestion", "bug", "content", "partner"
+    message = Column(Text, nullable=False)
+    source = Column(String(32), default="web") # "web" або "telegram_bot"
+    status = Column(String(32), default="new") # "new", "reviewed", "resolved"
+    created_at = Column(DateTime, default=datetime.utcnow)

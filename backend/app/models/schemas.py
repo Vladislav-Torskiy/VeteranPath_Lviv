@@ -71,3 +71,38 @@ class LeadSubmitRequest(BaseModel):
     opportunity_id: str
     contact_channel: str
     note: Optional[str] = None
+
+# ================= AUTH SCHEMAS =================
+class RegisterRequest(BaseModel):
+    phone: str = Field(..., description="Номер телефону ветерана (+380...)")
+    password: str = Field(..., min_length=4, description="Пароль для доступу з комп'ютера і смартфона")
+    full_name: Optional[str] = None
+    existing_token: Optional[str] = None # Якщо вже проходив анонімний онбординг, прив'язати його
+
+class LoginRequest(BaseModel):
+    phone: str = Field(..., description="Номер телефону ветерана")
+    password: str = Field(..., description="Пароль")
+
+class AuthResponse(BaseModel):
+    status: str
+    message: str
+    user_token: str
+    phone: str
+    full_name: Optional[str] = None
+
+# ================= FEEDBACK SCHEMAS =================
+class FeedbackCreateRequest(BaseModel):
+    message: str = Field(..., min_length=5, description="Текст зауваження або пропозиції")
+    sender_name: Optional[str] = None
+    sender_contact: Optional[str] = None
+    category: Optional[str] = "general"
+
+class FeedbackResponse(BaseModel):
+    id: int
+    sender_name: Optional[str]
+    sender_contact: Optional[str]
+    category: str
+    message: str
+    source: str
+    status: str
+    created_at: str
