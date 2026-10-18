@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, Boolean, Text, DateTime, ForeignKey, JSON
+from sqlalchemy import Column, String, Integer, Boolean, Text, DateTime, ForeignKey, JSON, BigInteger
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -82,6 +82,10 @@ class Opportunity(Base):
     contact_url = Column(String(512), nullable=True)
     salary_range = Column(String(64), nullable=True)
     is_active = Column(Boolean, default=True)
+    # Нові поля для системи модерації
+    is_pending = Column(Boolean, default=False)  # чекає підтвердження адміна
+    submitted_by_chat_id = Column(BigInteger, nullable=True)  # Telegram chat_id надавача послуг
+    delete_reason = Column(Text, nullable=True)  # причина видалення
     source = Column(String(32), default="web") # "web" або "telegram_bot"
     created_at = Column(DateTime, default=datetime.utcnow)
 
