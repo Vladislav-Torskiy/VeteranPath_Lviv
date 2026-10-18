@@ -1,48 +1,76 @@
 import json
 import logging
+import re
 from typing import Dict, Any, List
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+PRIMARY_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_MODEL = "gemini-3.8-flash"
+
+def extract_json(text: str) -> Dict[str, Any]:
+    """Витягує валідний JSON з тексту, навіть якщо є markdown або додатковий текст"""
+    text = text.strip()
+    # Видаляємо ```json ... ```
+    if "```" in text:
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+        if match:
+            text = match.group(1).strip()
+    # Якщо все одно не починається з {, шукаємо перший { і останній }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end+1]
+    return json.loads(text)
+
 class AIService:
-    def __init__(self):
-        self.api_key = settings.GEMINI_API_KEY
-        self.mode = settings.AI_MODE
+    @property
+    def api_key(self) -> str:
+        return settings.GEMINI_API_KEY
+
+    @property
+    def mode(self) -> str:
+        return settings.AI_MODE
+
+    def _get_client(self):
+        from google import genai
+        return genai.Client(api_key=self.api_key)
 
     def parse_free_text_onboarding(self, raw_text: str) -> Dict[str, Any]:
         """
         Витягує структуровані параметри з вільної розповіді ветерана
         """
-        # Перевірка: якщо режим MOCK або ключ відсутній - використовуємо безвідмовний евристичний мок
         if self.mode == "MOCK" or not self.api_key or self.api_key.startswith("your_"):
+            logger.info("[AI Service] MOCK mode: parsing free text")
             return self._mock_parse_free_text(raw_text)
 
-        try:
-            from google import genai
-            client = genai.Client(api_key=self.api_key)
-            prompt = f"""
-Ти експертний помічник ветеранської платформи. Твоє завдання - проаналізувати вільний текст ветерана і повернути ТІЛЬКИ валідний JSON без зайвих слів і markdown-форматування:
+        prompt = f"""
+Ти експертний помічник ветеранської платформи VeteranPath Lviv.
+Твоє завдання — уважно проаналізувати вільний текст ветерана та повернути ТІЛЬКИ валідний JSON:
 {{
   "status": "ubd" | "active_duty" | "disability" | "family_member",
   "region": "Львівська область",
-  "city": "назва міста або Львів",
-  "demobilized_date": "приблизна дата або 'нещодавно'",
+  "city": "назва міста громади або Львів",
+  "demobilized_date": "приблизна дата або 'Нещодавно'",
   "health_status": "none" | "rehab_needed" | "prosthetics_needed" | "psychological",
   "primary_goal": "work" | "business" | "education" | "health",
   "education": "освіта або 'Середня спеціальна / вища'",
-  "summary_message": "Людяне підсумування 1-2 реченнями: як ти зрозумів ситуацію людини"
+  "summary_message": "Людяне підсумування 1-2 реченнями: як ти зрозумів ситуацію цієї людини та її пріоритети"
 }}
 
 Текст ветерана:
 \"{raw_text}\"
 """
+        try:
+            logger.info(f"[AI Service] Calling Gemini ({PRIMARY_MODEL}) for onboarding parse...")
+            client = self._get_client()
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=PRIMARY_MODEL,
                 contents=prompt
             )
-            cleaned = response.text.strip().replace("```json", "").replace("```", "").strip()
-            data = json.loads(cleaned)
+            data = extract_json(response.text)
+            logger.info("[AI Service] Gemini onboarding parse successful")
             return {
                 "parsed_profile": {
                     "status": data.get("status", "ubd"),
@@ -53,11 +81,11 @@ class AIService:
                     "primary_goal": data.get("primary_goal", "work"),
                     "education": data.get("education", "Вища / середня спеціальна")
                 },
-                "summary_message": data.get("summary_message", "Дякуємо за службу! Ми виділили ключові потреби для вашого персонального плану."),
-                "confidence": 0.95
+                "summary_message": data.get("summary_message", "Дякуємо за службу! Ваші дані враховано для складання плану."),
+                "confidence": 0.98
             }
         except Exception as e:
-            logger.warning(f"Помилка виклику Gemini API ({e}), перемикання на резервний обробник.")
+            logger.error(f"[AI Service] Gemini error in parse_free_text: {e}. Fallback to mock.")
             return self._mock_parse_free_text(raw_text)
 
     def translate_military_experience(self, text: str, target_area: str = "management") -> Dict[str, Any]:
@@ -65,78 +93,117 @@ class AIService:
         Перекладає військовий досвід на мову цивільних вакансій та резюме
         """
         if self.mode == "MOCK" or not self.api_key or self.api_key.startswith("your_"):
+            logger.info("[AI Service] MOCK mode: translating military experience")
             return self._mock_translate_experience(text)
 
-        try:
-            from google import genai
-            client = genai.Client(api_key=self.api_key)
-            prompt = f"""
-Ти кар'єрний консультант, який допомагає ветеранам адаптувати військовий досвід для цивільних роботодавців.
-Проаналізуй опис служби і поверни ТІЛЬКИ валідний JSON:
+        prompt = f"""
+Ти професійний кар'єрний консультант, який допомагає ветеранам адаптувати реальний військовий досвід до цивільних вакансій і резюме.
+Проаналізуй наведений реальний опис служби (посада, обов'язки, техніка, підлеглі, термін) та сформуй ТОЧНУ, НЕ ШАБЛОННУ відповідь саме для цього військового фаху!
+
+Поверни ТІЛЬКИ валідний JSON у такому форматі:
 {{
-  "civilian_skills": ["навичка 1", "навичка 2", "навичка 3", "навичка 4"],
-  "resume_bullet_points": [
-    "Формулювання 1 для резюме дієсловом дії з фокусом на результат",
-    "Формулювання 2 для резюме",
-    "Формулювання 3 для резюме"
+  "civilian_skills": [
+    "Конкретна цивільна навичка 1 (з англійським аналогом або терміном)",
+    "Конкретна навичка 2",
+    "Конкретна навичка 3",
+    "Конкретна навичка 4",
+    "Конкретна навичка 5"
   ],
-  "recommended_roles": ["Професія 1", "Професія 2", "Професія 3"],
+  "resume_bullet_points": [
+    "Дієве формулювання для резюме 1 (дієслово дії + масштаб + результат саме на основі введеного досвіду)",
+    "Дієве формулювання для резюме 2",
+    "Дієве формулювання для резюме 3"
+  ],
+  "recommended_roles": [
+    "Релевантна цивільна професія 1",
+    "Релевантна цивільна професія 2",
+    "Релевантна цивільна професія 3"
+  ],
   "skill_gaps_and_courses": [
-    {{"role": "Професія 1", "gap": "Чого не вистачає", "course": "Рекомендований курс/сертифікат"}}
+    {{
+      "role": "Професія 1",
+      "gap": "Чого саме бракує з цивільних інструментів/стандартів",
+      "course": "Реальний курс, сертифікація або програма для ветеранів"
+    }},
+    {{
+      "role": "Професія 2",
+      "gap": "Чого саме бракує",
+      "course": "Рекомендований курс"
+    }}
   ]
 }}
 
 Опис служби ветерана:
 \"{text}\"
 """
+        try:
+            logger.info(f"[AI Service] Calling Gemini ({PRIMARY_MODEL}) for military translation...")
+            client = self._get_client()
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=PRIMARY_MODEL,
                 contents=prompt
             )
-            cleaned = response.text.strip().replace("```json", "").replace("```", "").strip()
-            return json.loads(cleaned)
+            data = extract_json(response.text)
+            logger.info("[AI Service] Gemini military translation successful!")
+            return data
         except Exception as e:
-            logger.warning(f"Помилка Gemini у translate_experience ({e}), fallback.")
+            logger.error(f"[AI Service] Gemini error in translate_experience: {e}. Fallback to mock.")
             return self._mock_translate_experience(text)
 
     def answer_chat_query(self, question: str, knowledge_items: List[Dict[str, str]]) -> Dict[str, Any]:
         """
-        Відповідь на запитання виключно на основі перевіреної бази знань (RAG-light)
+        Відповідь на запитання виключно на основі перевіреної бази знань та реального контексту
         """
         if self.mode == "MOCK" or not self.api_key or self.api_key.startswith("your_"):
+            logger.info("[AI Service] MOCK mode: answering chat query")
             return self._mock_answer_chat(question, knowledge_items)
 
-        try:
-            from google import genai
-            client = genai.Client(api_key=self.api_key)
-            context = "\n\n".join([f"Тема: {k['topic']}\nСуть: {k['summary']}\nДжерело: {k['official_source']}\nКонтакт: {k.get('contacts', '')}" for k in knowledge_items])
-            
-            prompt = f"""
-Ти юридичний та довідковий помічник ветерана у Львові. 
-Відповідай ВИКЛЮЧНО на основі наступної бази знань. Якщо інформації недостатньо, чесно скажи про це і порадь звернутися на гарячу лінію або до ЦНАП м. Львова.
-Завжди вказуй офіційне джерело закону або постанови.
+        context = "\n\n".join([
+            f"Тема: {k['topic']}\nСуть: {k['summary']}\nДжерело: {k['official_source']}\nКонтакт: {k.get('contacts', '')}"
+            for k in knowledge_items
+        ])
 
-База знань:
+        prompt = f"""
+Ти персональний консультант ветерана платформи VeteranPath Lviv.
+Твоє завдання — спілкуватися живо, поважно, українською мовою. 
+
+ПРАВИЛА ВІДПОВІДІ:
+1. Якщо користувач просто вітається («привіт», «добрий день», «хай») — тепло привітайся, подякуй за звернення і запитай, з яким питанням (пільги УБД, виплати, ЦНАП, реабілітація UNBROKEN/Superhumans, гранти на бізнес чи робота) ти можеш допомогти.
+2. Якщо користувач ставить конкретне запитання — дай чітку, структуровану відповідь по суті. Спирайся на офіційні дані Львова та законодавство України.
+3. Обов'язково вказуй, куди звертатися у Львові (ЦНАП, відділи соцзахисту, профільні центри) та які документи потрібні.
+
+Офіційна база знань платформи:
 {context}
 
-Запитання ветерана:
+Запитання або репліка ветерана:
 \"{question}\"
 """
+        try:
+            logger.info(f"[AI Service] Calling Gemini ({PRIMARY_MODEL}) for chat answer...")
+            client = self._get_client()
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=PRIMARY_MODEL,
                 contents=prompt
             )
-            sources = [k['official_source'] for k in knowledge_items if any(w.lower() in k['topic'].lower() or w.lower() in k['summary'].lower() for w in question.lower().split())]
-            if not sources:
-                sources = ["Законодавство України щодо ветеранів війни", "ЦНАП м. Львів"]
+            answer_text = response.text.strip()
+            logger.info("[AI Service] Gemini chat answer generated successfully!")
+
+            # Визначаємо релевантні джерела
+            lower_q = question.lower()
+            matched_sources = [
+                k['official_source'] for k in knowledge_items
+                if any(w in k['topic'].lower() or w in k['summary'].lower() for w in lower_q.split() if len(w) > 3)
+            ]
+            if not matched_sources:
+                matched_sources = ["Закон України «Про статус ветеранів війни»", "ЦНАП м. Львова"]
 
             return {
-                "answer": response.text.strip(),
-                "sources": sources[:2],
+                "answer": answer_text,
+                "sources": matched_sources[:2],
                 "recommended_hotlines": ["1545 (кнопка 9 — Ветеранська лінія)", "0 800 333 003 (UNBROKEN Львів)"]
             }
         except Exception as e:
-            logger.warning(f"Помилка Gemini у answer_chat_query ({e}), fallback.")
+            logger.error(f"[AI Service] Gemini error in answer_chat_query: {e}. Fallback to mock.")
             return self._mock_answer_chat(question, knowledge_items)
 
     # =========================================================================
@@ -228,9 +295,15 @@ class AIService:
 
     def _mock_answer_chat(self, question: str, knowledge_items: List[Dict[str, str]]) -> Dict[str, Any]:
         lower = question.lower()
-        if "убд" in lower or "пільг" in lower:
+        if "привіт" in lower or "добрий" in lower or "вітаю" in lower:
             return {
-                "answer": "Статус УБД надає 75% знижку на житлово-комунальні послуги, право на безоплатний проїзд міським транспортом, позачергове меддопомогу та ваучери на навчання. Документи можна подати у будь-якому ЦНАП м. Львова або через сервісний офіс у справах ветеранів.",
+                "answer": "Вітаю! Я цифровий юридичний та довідковий консультант VeteranPath Lviv. Чим можу допомогти вам сьогодні? Ви можете запитати про пільги УБД, знижки на комунальні послуги, медичну реабілітацію в UNBROKEN або гранти на власну справу.",
+                "sources": ["Офіційний ветеранський портал Львівщини"],
+                "recommended_hotlines": ["1545 (кнопка 9 — Ветеранська лінія)", "0 800 333 003 (UNBROKEN Львів)"]
+            }
+        elif "убд" in lower or "пільг" in lower:
+            return {
+                "answer": "Статус УБД надає 75% знижку на житлово-комунальні послуги, право на безоплатний проїзд міським транспортом, позачергову меддопомогу та ваучери на навчання. Документи можна подати у будь-якому ЦНАП м. Львова або через сервісний офіс у справах ветеранів.",
                 "sources": ["Закон України «Про статус ветеранів війни» ст. 12", "ЦНАП м. Львова"],
                 "recommended_hotlines": ["1545 (кнопка 9 — Ветеранська лінія)", "032 297 57 95 (ЦНАП Львів)"]
             }

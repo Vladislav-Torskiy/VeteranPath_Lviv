@@ -92,7 +92,7 @@ class AuthResponse(BaseModel):
 
 # ================= FEEDBACK SCHEMAS =================
 class FeedbackCreateRequest(BaseModel):
-    message: str = Field(..., min_length=5, description="Текст зауваження або пропозиції")
+    message: str = Field(..., min_length=1, description="Текст зауваження або пропозиції")
     sender_name: Optional[str] = None
     sender_contact: Optional[str] = None
     category: Optional[str] = "general"

@@ -41,7 +41,13 @@ export default function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
 
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
-        throw new Error(errData.detail || `Помилка ${response.status}`);
+        let message = `Помилка ${response.status}`;
+        if (typeof errData.detail === "string") {
+          message = errData.detail;
+        } else if (Array.isArray(errData.detail)) {
+          message = errData.detail.map((err: any) => err.msg || JSON.stringify(err)).join("; ");
+        }
+        throw new Error(message);
       }
 
       setSuccess(true);
