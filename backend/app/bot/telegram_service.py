@@ -1,9 +1,17 @@
 """
 Telegram-бот для платформи VeteranPath Lviv
 Система ролей:
-  - Надавач послуг (service_provider): надсилає заявки на вакансії/курси/гранти → адмін підтверджує
-    Може: редагувати/видаляти власні АКТИВНІ пропозиції (з обов'язковою причиною видалення)
-  - Адміністратор (admin): підтверджує або відхиляє заявки, переглядає всі дані, відгуки, зауваження
+  - Надавач послуг (service_provider):
+      * Подає нову пропозицію (вакансію, курс, грант) -> вона потрапляє на розгляд адміну
+      * Переглядає всі активні програми на платформі
+      * Може подати запит на деактивацію/видалення своєї пропозиції (або надіслати повідомлення адміністратору)
+      * Залишає відгуки та пропозиції
+  - Адміністратор (admin):
+      * Модерує пропозиції (підтвердити / відхилити з вказанням причини)
+      * Переглядає всі пропозиції в базі
+      * Може ВИДАЛЯТИ будь-яку пропозицію/вакансію з бази із обов'язковим вказанням причини
+      * Додає пропозиції напряму
+      * Переглядає всі зауваження та звернення
 """
 
 import logging
@@ -31,13 +39,11 @@ logger = logging.getLogger(__name__)
     ADD_BENEFITS,
     ADD_SALARY,
     ADD_FEEDBACK,
-    EDIT_SELECT,
-    EDIT_FIELD,
-    EDIT_VALUE,
-    DELETE_REASON,
+    PARTNER_REQUEST_DELETE,
+    ADMIN_DELETE_REASON,
     ADMIN_PENDING,
     ADMIN_REJECT_REASON,
-) = range(15)
+) = range(13)
 
 USER_ROLES = {}   # chat_id -> "service_provider" | "admin"
 TEMP_DATA  = {}   # chat_id -> dict з тимчасовими даними
@@ -47,15 +53,16 @@ TEMP_DATA  = {}   # chat_id -> dict з тимчасовими даними
 def kb_service_provider():
     return ReplyKeyboardMarkup([
         ["➕ Подати нову пропозицію"],
-        ["📋 Мої пропозиції (редагувати/видалити)"],
+        ["📋 Активні програми на платформі"],
+        ["🗑️ Запит адміністратору на видалення"],
         ["✍️ Залишити зауваження/відгук"],
         ["🚪 Вийти"],
     ], resize_keyboard=True)
 
 def kb_admin():
     return ReplyKeyboardMarkup([
-        ["🔔 Пропозиції на розгляді (підтвердити/відхилити)"],
-        ["📊 Всі активні пропозиції в базі"],
+        ["🔔 Пропозиції на розгляді (модерація)"],
+        ["📊 Керування пропозиціями (перегляд/видалення)"],
         ["📨 Зауваження та відгуки користувачів"],
         ["➕ Додати пропозицію напряму"],
         ["🚪 Вийти"],
@@ -66,11 +73,12 @@ def kb_admin():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
     USER_ROLES.pop(chat_id, None)
+    TEMP_DATA.pop(chat_id, None)
     await update.message.reply_text(
         "🇺🇦 *Вітаємо в Telegram-боті VeteranPath Lviv!*\n\n"
         "Введіть пароль для входу:\n"
-        "• Якщо ви роботодавець / надавач послуг — пароль *надавача*\n"
-        "• Якщо ви адміністратор платформи — пароль *адміністратора*",
+        "• Якщо ви партнер / надавач послуг — введіть пароль *надавача*\n"
+        "• Якщо ви адміністратор платформи — введіть пароль *адміністратора*",
         parse_mode="Markdown"
     )
     return AUTH
@@ -82,15 +90,16 @@ async def handle_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if pwd == settings.TELEGRAM_ADMIN_PASSWORD:
         USER_ROLES[chat_id] = "admin"
         await update.message.reply_text(
-            "✅ *Авторизовано як Адміністратор платформи!*",
+            "✅ *Авторизовано як Адміністратор платформи!*\n"
+            "Вам доступне повне керування, затвердження та видалення вакансій/програм.",
             reply_markup=kb_admin(), parse_mode="Markdown"
         )
         return MENU
     elif pwd == settings.TELEGRAM_PARTNER_PASSWORD:
         USER_ROLES[chat_id] = "service_provider"
         await update.message.reply_text(
-            "✅ *Авторизовано як Надавач послуг!*\n"
-            "Ваші нові пропозиції побачать ветерани після підтвердження адміністратором.",
+            "✅ *Авторизовано як Надавач послуг (Партнер)!*\n"
+            "Ви можете подавати нові програми та вакансії на модерацію адміністратору.",
             reply_markup=kb_service_provider(), parse_mode="Markdown"
         )
         return MENU
@@ -105,11 +114,11 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     text = update.message.text.strip()
     role = USER_ROLES.get(chat_id)
 
-    # Вихід
     if text == "🚪 Вийти":
         USER_ROLES.pop(chat_id, None)
+        TEMP_DATA.pop(chat_id, None)
         await update.message.reply_text(
-            "Ви вийшли. Введіть /start для нового входу.",
+            "Ви вийшли з кабінету. Введіть /start для нового входу.",
             reply_markup=ReplyKeyboardRemove()
         )
         return ConversationHandler.END
@@ -118,30 +127,40 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if text == "➕ Подати нову пропозицію":
         TEMP_DATA[chat_id] = {}
         await update.message.reply_text(
-            "Введіть *назву* вакансії/курсу/гранту:\n_(наприклад: «Координатор логістики» або «Грант на обладнання»)_",
+            "Введіть *назву* вакансії, курсу або гранту:\n_(наприклад: «Координатор логістики» або «Грант на обладнання»)_",
             reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown"
         )
         return ADD_TITLE
 
-    if text == "📋 Мої пропозиції (редагувати/видалити)":
-        return await show_my_opportunities(update, context)
+    if text in ["📋 Активні програми на платформі", "📋 Мої пропозиції (редагувати/видалити)"]:
+        return await show_all_active(update, context)
+
+    if text == "🗑️ Запит адміністратору на видалення":
+        await update.message.reply_text(
+            "Вкажіть назву вашої вакансії/програми та *причину видалення*:\n"
+            "_(Адміністратор отримає запит і деактивує пропозицію в системі)_",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return PARTNER_REQUEST_DELETE
 
     if text == "✍️ Залишити зауваження/відгук":
         await update.message.reply_text(
-            "Напишіть ваше зауваження, ідею або пропозицію:",
+            "Напишіть ваше зауваження, побажання або запитання:",
             reply_markup=ReplyKeyboardRemove()
         )
         return ADD_FEEDBACK
 
-    # ─── Адмін ───
-    if text == "🔔 Пропозиції на розгляді (підтвердити/відхилити)":
+    # ─── Адміністратор ───
+    if text in ["🔔 Пропозиції на розгляді (модерація)", "🔔 Пропозиції на розгляді (підтвердити/відхилити)"]:
         if role != "admin":
             await update.message.reply_text("⛔ Доступно лише адміністратору.")
             return MENU
         return await show_pending(update, context)
 
-    if text in ["📊 Всі активні пропозиції в базі", "📋 Мої активні пропозиції"]:
-        return await show_all_active(update, context)
+    if text in ["📊 Керування пропозиціями (перегляд/видалення)", "📊 Всі активні пропозиції в базі"]:
+        if role != "admin":
+            return await show_all_active(update, context)
+        return await admin_show_manageable_opportunities(update, context)
 
     if text == "📨 Зауваження та відгуки користувачів":
         if role != "admin":
@@ -159,7 +178,129 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     return MENU
 
-# ── Перегляд пропозицій на розгляді (Адмін) ─────────────────────────────────
+# ── Перегляд та видалення для Адміністратора ──────────────────────────────────
+
+async def admin_show_manageable_opportunities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = update.effective_chat.id
+    with SessionLocal() as db:
+        items = db.query(Opportunity).filter(
+            Opportunity.is_active == True,
+            Opportunity.is_pending == False
+        ).order_by(Opportunity.created_at.desc()).limit(20).all()
+
+        if not items:
+            await update.message.reply_text(
+                "Наразі немає активних пропозицій у базі даних.",
+                reply_markup=kb_admin()
+            )
+            return MENU
+
+        msg = "📊 *Керування пропозиціями на платформі:*\n\n"
+        keyboards = []
+        for i, item in enumerate(items, 1):
+            msg += f"{i}. *{item.title}*\n   Партнер: _{item.partner_name}_ | {item.location}\n\n"
+            keyboards.append([
+                InlineKeyboardButton(f"🗑️ Видалити: {item.title[:24]}", callback_data=f"adm_del:{item.id}")
+            ])
+
+        await update.message.reply_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboards) if keyboards else None
+        )
+    return MENU
+
+async def handle_admin_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    _, opp_id = query.data.split(":", 1)
+
+    with SessionLocal() as db:
+        item = db.query(Opportunity).filter(Opportunity.id == opp_id).first()
+        if not item:
+            await query.edit_message_text("⛔ Пропозицію вже не знайдено.")
+            return MENU
+        title = item.title
+
+    TEMP_DATA[chat_id] = {"admin_del_id": opp_id, "admin_del_title": title}
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"⚠️ Ви обрали видалення: *«{title}»*.\n\n"
+            f"Вкажіть *причину видалення* (вона збережеться в базі даних, щоб надати пояснення ветеранам або партнерам):"
+        ),
+        parse_mode="Markdown"
+    )
+    return ADMIN_DELETE_REASON
+
+async def handle_admin_delete_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = update.effective_chat.id
+    reason = update.message.text.strip()
+    data = TEMP_DATA.get(chat_id, {})
+    opp_id = data.get("admin_del_id")
+    title = data.get("admin_del_title", "пропозиція")
+
+    partner_chat_id = None
+    if opp_id:
+        with SessionLocal() as db:
+            item = db.query(Opportunity).filter(Opportunity.id == opp_id).first()
+            if item:
+                item.is_active = False
+                item.is_pending = False
+                item.delete_reason = reason
+                partner_chat_id = item.submitted_by_chat_id
+                db.commit()
+
+    await update.message.reply_text(
+        f"🗑️ Пропозицію *«{title}»* успішно деактивовано з сайту та бази!\n"
+        f"📝 Причина зафіксована: _{reason}_",
+        parse_mode="Markdown",
+        reply_markup=kb_admin()
+    )
+
+    # Якщо пропозицію подавав партнер, повідомляємо його
+    if partner_chat_id:
+        try:
+            await context.bot.send_message(
+                chat_id=partner_chat_id,
+                text=(
+                    f"ℹ️ Вашу вакансію/програму *«{title}»* було знято з публікації адміністратором.\n\n"
+                    f"*Причина:* {reason}"
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+    return MENU
+
+# ── Запит на видалення від надавача послуг ────────────────────────────────────
+
+async def handle_partner_request_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = update.effective_chat.id
+    user_name = update.effective_user.username or update.effective_user.first_name or f"ID:{chat_id}"
+    req_text = update.message.text.strip()
+
+    with SessionLocal() as db:
+        fb = FeedbackItem(
+            sender_name=f"Партнер {user_name}",
+            sender_contact=f"@{update.effective_user.username}" if update.effective_user.username else f"tg:{chat_id}",
+            category="deletion_request",
+            message=f"[ЗАПИТ НА ВИДАЛЕННЯ]: {req_text}",
+            source="telegram_bot"
+        )
+        db.add(fb)
+        db.commit()
+
+    await update.message.reply_text(
+        "✅ Ваш запит на видалення успішно надіслано адміністратору платформи.\n"
+        "Адміністратор перевірить заявку та деактивує пропозицію.",
+        reply_markup=kb_service_provider()
+    )
+    return MENU
+
+# ── Перегляд пропозицій на розгляді (Адмін модерація) ────────────────────────
 
 async def show_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
@@ -176,14 +317,12 @@ async def show_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             return MENU
 
         TEMP_DATA[chat_id] = {"pending_ids": [item.id for item in items], "pending_index": 0}
-
-        # Показуємо першу заявку
         await show_pending_item(update, context, items[0])
     return ADMIN_PENDING
 
 async def show_pending_item(update, context, item):
     text = (
-        f"📩 *Нова заявка на розміщення:*\n\n"
+        f"📩 *Заявка на модерацію:*\n\n"
         f"📌 *Назва:* {item.title}\n"
         f"🏢 *Організація:* {item.partner_name}\n"
         f"📂 *Тип:* {item.type}\n"
@@ -213,16 +352,19 @@ async def handle_pending_callback(update: Update, context: ContextTypes.DEFAULT_
             if item:
                 item.is_pending = False
                 item.is_active = True
-                db.commit()
                 partner_chat_id = item.submitted_by_chat_id
                 title = item.title
-        await query.edit_message_text(f"✅ Пропозицію «{title}» підтверджено та опубліковано!")
-        # Повідомляємо надавача послуг
+                db.commit()
+            else:
+                title = "пропозиція"
+                partner_chat_id = None
+
+        await query.edit_message_text(f"✅ Пропозицію «{title}» схвалено та опубліковано на сайті!")
         if partner_chat_id:
             try:
                 await context.bot.send_message(
                     chat_id=partner_chat_id,
-                    text=f"🎉 Ваша пропозиція *«{title}»* підтверджена адміністратором та вже видна ветеранам на платформі!",
+                    text=f"🎉 Ваша пропозиція *«{title}»* підтверджена адміністратором та вже опублікована для ветеранів!",
                     parse_mode="Markdown"
                 )
             except Exception:
@@ -233,12 +375,12 @@ async def handle_pending_callback(update: Update, context: ContextTypes.DEFAULT_
         TEMP_DATA[chat_id]["reject_opp_id"] = opp_id
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Вкажіть *причину відхилення* (вона буде надіслана надавачу послуг):",
+            text="Вкажіть *причину відхилення* (вона збережеться і буде передана надавачу):",
             parse_mode="Markdown"
         )
         return ADMIN_REJECT_REASON
 
-    # Перевіряємо чи є ще заявки
+    # Перевірка наступних заявок
     data = TEMP_DATA.get(chat_id, {})
     idx = data.get("pending_index", 0) + 1
     pending_ids = data.get("pending_ids", [])
@@ -248,16 +390,11 @@ async def handle_pending_callback(update: Update, context: ContextTypes.DEFAULT_
         with SessionLocal() as db:
             next_item = db.query(Opportunity).filter(Opportunity.id == pending_ids[idx]).first()
             if next_item and next_item.is_pending:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"Залишилось ще {len(pending_ids) - idx} заявок. Наступна:"
-                )
-                # Надсилаємо як нове повідомлення
                 text = (
-                    f"📩 *Нова заявка:*\n\n"
+                    f"📩 *Наступна заявка ({idx + 1}/{len(pending_ids)}):*\n\n"
                     f"📌 *{next_item.title}* від *{next_item.partner_name}*\n"
                     f"📂 {next_item.type} | 📍 {next_item.location}\n"
-                    f"📝 {next_item.description[:200]}...\n"
+                    f"📝 {next_item.description[:180]}...\n"
                     f"💰 {next_item.salary_range or 'За домовленістю'}"
                 )
                 keyboard = InlineKeyboardMarkup([[
@@ -268,7 +405,7 @@ async def handle_pending_callback(update: Update, context: ContextTypes.DEFAULT_
     else:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="✅ Всі заявки оброблено!",
+            text="✅ Всі заявки з черги розглянуто!",
             reply_markup=kb_admin()
         )
 
@@ -280,7 +417,7 @@ async def handle_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYP
     opp_id = TEMP_DATA.get(chat_id, {}).get("reject_opp_id")
 
     partner_chat_id = None
-    title = "невідома"
+    title = "пропозиція"
     if opp_id:
         with SessionLocal() as db:
             item = db.query(Opportunity).filter(Opportunity.id == opp_id).first()
@@ -293,7 +430,8 @@ async def handle_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYP
                 db.commit()
 
     await update.message.reply_text(
-        f"❌ Пропозицію «{title}» відхилено.",
+        f"❌ Пропозицію «{title}» відхилено. Причина збережена: _{reason}_",
+        parse_mode="Markdown",
         reply_markup=kb_admin()
     )
 
@@ -302,9 +440,9 @@ async def handle_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYP
             await context.bot.send_message(
                 chat_id=partner_chat_id,
                 text=(
-                    f"❌ Вашу пропозицію *«{title}»* адміністратор відхилив.\n\n"
+                    f"❌ Вашу пропозицію *«{title}»* відхилено адміністратором.\n\n"
                     f"*Причина:* {reason}\n\n"
-                    f"Ви можете подати виправлену версію через «➕ Подати нову пропозицію»."
+                    f"Ви можете внести корективи та подати нову заявку."
                 ),
                 parse_mode="Markdown"
             )
@@ -313,212 +451,60 @@ async def handle_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYP
 
     return MENU
 
-# ── Перегляд активних пропозицій ─────────────────────────────────────────────
+# ── Перегляд активних програм (для надавача) ──────────────────────────────────
 
 async def show_all_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
     role = USER_ROLES.get(chat_id)
     with SessionLocal() as db:
-        query = db.query(Opportunity).filter(Opportunity.is_active == True, Opportunity.is_pending == False)
-        items = query.order_by(Opportunity.created_at.desc()).limit(10).all()
+        items = db.query(Opportunity).filter(
+            Opportunity.is_active == True,
+            Opportunity.is_pending == False
+        ).order_by(Opportunity.created_at.desc()).limit(15).all()
 
         if not items:
-            await update.message.reply_text("В базі поки немає активних пропозицій.")
+            await update.message.reply_text("Наразі немає активних пропозицій у базі.")
             return MENU
 
-        msg = "📋 *Активні вакансії та програми:*\n\n"
+        msg = "📋 *Активні вакансії та програми на платформі:*\n\n"
         for i, item in enumerate(items, 1):
             msg += f"{i}. *{item.title}* ({item.partner_name})\n"
-            msg += f"   {item.type} | {item.location} | {item.salary_range or 'За домовленістю'}\n\n"
+            msg += f"   Тип: {item.type} | Локація: {item.location} | З/П або Грант: {item.salary_range or 'За домовленістю'}\n\n"
 
     kb = kb_admin() if role == "admin" else kb_service_provider()
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
     return MENU
 
-# ── Мої пропозиції (для надавача послуг) ─────────────────────────────────────
-
-async def show_my_opportunities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    chat_id = update.effective_chat.id
-    with SessionLocal() as db:
-        items = db.query(Opportunity).filter(
-            Opportunity.submitted_by_chat_id == chat_id
-        ).order_by(Opportunity.created_at.desc()).limit(15).all()
-
-        if not items:
-            await update.message.reply_text(
-                "У вас поки немає поданих пропозицій.\nСкористайтеся «➕ Подати нову пропозицію».",
-                reply_markup=kb_service_provider()
-            )
-            return MENU
-
-        msg = "📋 *Ваші пропозиції:*\n\n"
-        keyboards = []
-        for item in items:
-            status = "🟡 На розгляді" if item.is_pending else ("🟢 Активна" if item.is_active else "🔴 Відхилена/Видалена")
-            msg += f"• *{item.title}* — {status}\n  ID: `{item.id[:12]}...`\n\n"
-            if item.is_active or item.is_pending:
-                keyboards.append([
-                    InlineKeyboardButton(f"✏️ {item.title[:25]}", callback_data=f"edit:{item.id}"),
-                    InlineKeyboardButton("🗑️ Видалити", callback_data=f"delete:{item.id}"),
-                ])
-
-        await update.message.reply_text(
-            msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboards) if keyboards else None
-        )
-    return MENU
-
-async def handle_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    action, opp_id = query.data.split(":", 1)
-
-    if action == "delete":
-        # Перевіряємо, що це власна пропозиція
-        with SessionLocal() as db:
-            item = db.query(Opportunity).filter(
-                Opportunity.id == opp_id,
-                Opportunity.submitted_by_chat_id == chat_id
-            ).first()
-            if not item:
-                await query.edit_message_text("⛔ Пропозицію не знайдено або у вас немає прав.")
-                return MENU
-            title = item.title
-
-        TEMP_DATA[chat_id] = {"delete_opp_id": opp_id, "delete_title": title}
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"Ви збираєтесь видалити «*{title}*».\n\n⚠️ Вкажіть *причину видалення* (вона збережеться в системі, щоб відповісти ветеранам, якщо вони запитають):",
-            parse_mode="Markdown"
-        )
-        return DELETE_REASON
-
-    if action == "edit":
-        with SessionLocal() as db:
-            item = db.query(Opportunity).filter(
-                Opportunity.id == opp_id,
-                Opportunity.submitted_by_chat_id == chat_id
-            ).first()
-            if not item:
-                await query.edit_message_text("⛔ Пропозицію не знайдено або у вас немає прав.")
-                return MENU
-
-        TEMP_DATA[chat_id] = {"edit_opp_id": opp_id}
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📌 Назва", callback_data=f"editf:title:{opp_id}"),
-             InlineKeyboardButton("📝 Опис", callback_data=f"editf:description:{opp_id}")],
-            [InlineKeyboardButton("🎖️ Переваги", callback_data=f"editf:benefits:{opp_id}"),
-             InlineKeyboardButton("💰 Зарплата", callback_data=f"editf:salary_range:{opp_id}")],
-        ])
-        await query.edit_message_text(
-            "✏️ Що хочете відредагувати?",
-            reply_markup=keyboard
-        )
-        return EDIT_FIELD
-
-    return MENU
-
-async def handle_edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    _, field, opp_id = query.data.split(":", 2)
-
-    TEMP_DATA[chat_id] = TEMP_DATA.get(chat_id, {})
-    TEMP_DATA[chat_id]["edit_opp_id"] = opp_id
-    TEMP_DATA[chat_id]["edit_field"] = field
-
-    field_names = {
-        "title": "нову назву",
-        "description": "новий опис",
-        "benefits": "нові переваги для ветеранів",
-        "salary_range": "нову зарплату/розмір гранту"
-    }
-    await query.edit_message_text(f"Введіть {field_names.get(field, field)}:")
-    return EDIT_VALUE
-
-async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    chat_id = update.effective_chat.id
-    new_value = update.message.text.strip()
-    data = TEMP_DATA.get(chat_id, {})
-    opp_id = data.get("edit_opp_id")
-    field = data.get("edit_field")
-
-    allowed_fields = {"title", "description", "benefits", "salary_range"}
-    if not opp_id or field not in allowed_fields:
-        await update.message.reply_text("Помилка. Почніть знову.", reply_markup=kb_service_provider())
-        return MENU
-
-    with SessionLocal() as db:
-        item = db.query(Opportunity).filter(
-            Opportunity.id == opp_id,
-            Opportunity.submitted_by_chat_id == chat_id
-        ).first()
-        if not item:
-            await update.message.reply_text("⛔ Пропозицію не знайдено.", reply_markup=kb_service_provider())
-            return MENU
-        setattr(item, field, new_value)
-        title = item.title
-        db.commit()
-
-    await update.message.reply_text(
-        f"✅ Пропозицію «{title}» оновлено!",
-        reply_markup=kb_service_provider()
-    )
-    return MENU
-
-async def handle_delete_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    chat_id = update.effective_chat.id
-    reason = update.message.text.strip()
-    data = TEMP_DATA.get(chat_id, {})
-    opp_id = data.get("delete_opp_id")
-    title = data.get("delete_title", "невідома")
-
-    if opp_id:
-        with SessionLocal() as db:
-            item = db.query(Opportunity).filter(
-                Opportunity.id == opp_id,
-                Opportunity.submitted_by_chat_id == chat_id
-            ).first()
-            if item:
-                item.is_active = False
-                item.is_pending = False
-                item.delete_reason = reason
-                db.commit()
-
-    await update.message.reply_text(
-        f"🗑️ Пропозицію «{title}» видалено.\n📝 Причина збережена: «{reason}»",
-        reply_markup=kb_service_provider()
-    )
-    return MENU
-
-# ── Зауваження та відгуки ─────────────────────────────────────────────────────
+# ── Зауваження та відгуки (для адміна) ────────────────────────────────────────
 
 async def show_feedbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     with SessionLocal() as db:
         items = db.query(FeedbackItem).order_by(FeedbackItem.created_at.desc()).limit(15).all()
         if not items:
-            await update.message.reply_text("Зауважень поки немає!", reply_markup=kb_admin())
+            await update.message.reply_text("Зауважень та звернень поки немає!", reply_markup=kb_admin())
             return MENU
 
-        msg = "📨 *Останні зауваження та відгуки:*\n\n"
+        msg = "📨 *Останні звернення, відгуки та запити:*\n\n"
         for f in items:
-            cat_emoji = {"suggestion": "💡", "bug": "🐛", "partner": "🤝", "general": "❓"}.get(f.category, "📩")
-            msg += f"{cat_emoji} [{f.category.upper()}] від *{f.sender_contact or 'Анонімно'}*\n"
+            cat_emoji = {
+                "suggestion": "💡",
+                "bug": "🐛",
+                "partner": "🤝",
+                "general": "❓",
+                "deletion_request": "🗑️"
+            }.get(f.category, "📩")
+            msg += f"{cat_emoji} *[{f.category.upper()}]* від *{f.sender_contact or f.sender_name or 'Користувач'}*\n"
             msg += f'  "{f.message}"\n'
-            msg += f"  {f.created_at.strftime('%d.%m %H:%M')} | {f.source}\n\n"
-            if len(msg) > 3500:
-                msg += "_(ще більше у веб-панелі партнера)_"
-                break
+            msg += f"  Час: {f.created_at.strftime('%d.%m %H:%M')} | Джерело: {f.source}\n\n"
 
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb_admin())
     return MENU
 
-# ── Покроковий майстер додавання ─────────────────────────────────────────────
+# ── Покроковий майстер додавання пропозиції ──────────────────────────────────
 
 async def step_add_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
+    TEMP_DATA[chat_id] = TEMP_DATA.get(chat_id, {})
     TEMP_DATA[chat_id]["title"] = update.message.text.strip()
     await update.message.reply_text(
         "Введіть *назву вашої організації/компанії*:\n_(наприклад: Meest Пошта або Ветеранський фонд)_",
@@ -551,7 +537,7 @@ async def step_add_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     chat_id = update.effective_chat.id
     TEMP_DATA[chat_id]["description"] = update.message.text.strip()
     await update.message.reply_text(
-        "Вкажіть *ветеранські переваги*:\n_(гнучкий графік, ментор, допомога з житлом тощо)_",
+        "Вкажіть *ветеранські переваги*:\n_(гнучкий графік, ментор з бойовим досвідом, допомога з житлом тощо)_",
         parse_mode="Markdown"
     )
     return ADD_BENEFITS
@@ -577,7 +563,6 @@ async def step_add_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else "business"
     )
 
-    # Пряме додавання (адмін без модерації)
     is_direct = data.get("direct") or role == "admin"
 
     with SessionLocal() as db:
@@ -603,17 +588,17 @@ async def step_add_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     kb = kb_admin() if role == "admin" else kb_service_provider()
 
     if is_direct:
-        msg = "🎉 *Опубліковано!* Ваша пропозиція вже доступна ветеранам."
+        msg = "🎉 *Опубліковано!* Ваша пропозиція вже активна на сайті."
     else:
         msg = (
-            "📤 *Заявку подано!* Адміністратор розгляне її найближчим часом.\n"
-            "Після підтвердження ваша пропозиція з'явиться на сайті, і ви отримаєте повідомлення."
+            "📤 *Заявку подано на модерацію!* Адміністратор платформи перегляне її.\n"
+            "Після схвалення вона одразу з'явиться для ветеранів, і ви отримаєте повідомлення в боті."
         )
 
     await update.message.reply_text(msg, reply_markup=kb, parse_mode="Markdown")
     return MENU
 
-# ── Зауваження від надавача ───────────────────────────────────────────────────
+# ── Зауваження від партнера ───────────────────────────────────────────────────
 
 async def step_add_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
@@ -632,7 +617,7 @@ async def step_add_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         db.commit()
 
     kb = kb_admin() if role == "admin" else kb_service_provider()
-    await update.message.reply_text("🙏 Дякуємо! Зауваження передано адміністратору.", reply_markup=kb)
+    await update.message.reply_text("🙏 Дякуємо! Ваше звернення передано адміністратору платформи.", reply_markup=kb)
     return MENU
 
 # ── Запуск бота ───────────────────────────────────────────────────────────────
@@ -648,30 +633,27 @@ def run_bot():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            AUTH:              [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auth)],
-            MENU:              [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu)],
-            ADD_TITLE:         [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_title)],
-            ADD_PARTNER:       [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_partner)],
-            ADD_TYPE:          [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_type)],
-            ADD_DESC:          [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_desc)],
-            ADD_BENEFITS:      [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_benefits)],
-            ADD_SALARY:        [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_salary)],
-            ADD_FEEDBACK:      [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_feedback)],
-            EDIT_VALUE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_value)],
-            DELETE_REASON:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delete_reason)],
-            ADMIN_PENDING:     [CallbackQueryHandler(handle_pending_callback, pattern=r"^(approve|reject):")],
-            ADMIN_REJECT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reject_reason)],
-            EDIT_FIELD:        [CallbackQueryHandler(handle_edit_field_callback, pattern=r"^editf:")],
+            AUTH:                   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auth)],
+            MENU:                   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu)],
+            ADD_TITLE:              [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_title)],
+            ADD_PARTNER:            [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_partner)],
+            ADD_TYPE:               [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_type)],
+            ADD_DESC:               [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_desc)],
+            ADD_BENEFITS:           [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_benefits)],
+            ADD_SALARY:             [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_salary)],
+            ADD_FEEDBACK:           [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_feedback)],
+            PARTNER_REQUEST_DELETE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_partner_request_delete)],
+            ADMIN_DELETE_REASON:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_delete_reason)],
+            ADMIN_PENDING:          [CallbackQueryHandler(handle_pending_callback, pattern=r"^(approve|reject):")],
+            ADMIN_REJECT_REASON:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reject_reason)],
         },
         fallbacks=[CommandHandler("start", start)],
         per_user=True,
         per_chat=True,
     )
 
-    # CallbackQueryHandlers для кнопок "Мої пропозиції"
     app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(handle_manage_callback, pattern=r"^(edit|delete):"))
-    app.add_handler(CallbackQueryHandler(handle_edit_field_callback, pattern=r"^editf:"))
+    app.add_handler(CallbackQueryHandler(handle_admin_delete_callback, pattern=r"^adm_del:"))
 
     logger.info("Telegram-бот VeteranPath Lviv запущено!")
     app.run_polling()
