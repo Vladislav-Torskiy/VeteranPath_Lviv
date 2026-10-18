@@ -4,7 +4,7 @@ Telegram-бот для платформи VeteranPath Lviv
   - Надавач послуг (service_provider):
       * Подає нову пропозицію (вакансію, курс, грант) -> вона потрапляє на розгляд адміну
       * Переглядає всі активні програми на платформі
-      * Може подати запит на деактивацію/видалення своєї пропозиції (або надіслати повідомлення адміністратору)
+      * Може подати запит на деактивацію/видалення своєї пропозиції
       * Залишає відгуки та пропозиції
   - Адміністратор (admin):
       * Модерує пропозиції (підтвердити / відхилити з вказанням причини)
@@ -195,7 +195,7 @@ async def admin_show_manageable_opportunities(update: Update, context: ContextTy
             )
             return MENU
 
-        msg = "📊 *Керування пропозиціями на платформі:*\n\n"
+        msg = "📊 *Керування пропозиціями на платформі:*\n\nОберіть пропозицію, яку потрібно видалити:\n\n"
         keyboards = []
         for i, item in enumerate(items, 1):
             msg += f"{i}. *{item.title}*\n   Партнер: _{item.partner_name}_ | {item.location}\n\n"
@@ -228,7 +228,7 @@ async def handle_admin_delete_callback(update: Update, context: ContextTypes.DEF
         chat_id=chat_id,
         text=(
             f"⚠️ Ви обрали видалення: *«{title}»*.\n\n"
-            f"Вкажіть *причину видалення* (вона збережеться в базі даних, щоб надати пояснення ветеранам або партнерам):"
+            f"Вкажіть *причину видалення* (напишіть повідомленням у чат):"
         ),
         parse_mode="Markdown"
     )
@@ -250,6 +250,7 @@ async def handle_admin_delete_reason(update: Update, context: ContextTypes.DEFAU
                 item.is_pending = False
                 item.delete_reason = reason
                 partner_chat_id = item.submitted_by_chat_id
+                title = item.title
                 db.commit()
 
     await update.message.reply_text(
@@ -259,7 +260,6 @@ async def handle_admin_delete_reason(update: Update, context: ContextTypes.DEFAU
         reply_markup=kb_admin()
     )
 
-    # Якщо пропозицію подавав партнер, повідомляємо його
     if partner_chat_id:
         try:
             await context.bot.send_message(
@@ -634,7 +634,10 @@ def run_bot():
         entry_points=[CommandHandler("start", start)],
         states={
             AUTH:                   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auth)],
-            MENU:                   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu)],
+            MENU:                   [
+                CallbackQueryHandler(handle_admin_delete_callback, pattern=r"^adm_del:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu)
+            ],
             ADD_TITLE:              [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_title)],
             ADD_PARTNER:            [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_partner)],
             ADD_TYPE:               [MessageHandler(filters.TEXT & ~filters.COMMAND, step_add_type)],
@@ -653,7 +656,6 @@ def run_bot():
     )
 
     app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(handle_admin_delete_callback, pattern=r"^adm_del:"))
 
     logger.info("Telegram-бот VeteranPath Lviv запущено!")
     app.run_polling()
